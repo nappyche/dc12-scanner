@@ -1,194 +1,146 @@
 import math
 import re
 from datetime import datetime, timezone
+
 import requests
 import streamlit as st
 
 st.set_page_config(page_title="Double Chance (12) Scanner", layout="wide")
 
-API_HOST = "free-api-live-football-data.p.rapidapi.com"
-BASE_URL = f"https://{API_HOST}"
+BASE_URL = "https://v3.football.api-sports.io"
+FINISHED = "FT-AET-PEN"
+FINISHED_SET = {"FT", "AET", "PEN"}
+NOT_STARTED = {"NS", "TBD"}
+
+
+class ApiError(Exception):
+    pass
 
 
 def get_api_key() -> str:
     try:
-        return st.secrets["RAPIDAPI_KEY"].strip()
+        return st.secrets["API_FOOTBALL_KEY"].strip()
     except Exception:
         return ""
 
 
-def api_get(endpoint: str, params: dict, api_key: str) -> tuple[int, dict]:
-    headers = {
-        "x-rapidapi-key": api_key,
-        "x-rapidapi-host": API_HOST,
-    }
+def api_get(endpoint: str, params: dict, api_key: str):
+    """Calls API-Football. Raises ApiError on any problem (so failures are never cached)."""
     try:
         resp = requests.get(
-            f"{BASE_URL}/{endpoint.lstrip('/')}",
-            headers=headers,
+            f"{BASE_URL}/{endpoint}",
+            headers={"x-apisports-key": api_key},
             params=params,
-            timeout=15,
+            timeout=20,
         )
-        try:
-            data = resp.json()
-        except Exception:
-            data = {"raw_text": resp.text[:300]}
-        return resp.status_code, data
     except Exception as exc:
-        return 0, {"error": str(exc)}
+        raise ApiError(f"Network error: {exc}")
 
-
-def extract_matches_list(payload) -> list:
-    if isinstance(payload, list):
-        return payload
-    if not isinstance(payload, dict):
-        return []
-
-    response_obj = payload.get("response", payload)
-    if isinstance(response_obj, list):
-        return response_obj
-    if isinstance(response_obj, dict):
-        for key in ("matches", "events", "fixtures", "h2h", "headToHead", "items", "list"):
-            val = response_obj.get(key)
-            if isinstance(val, list):
-                return val
-        for val in response_obj.values():
-            if isinstance(val, list) and val and isinstance(val[0], dict):
-                return val
-    return []
-
-
-def parse_match_item(item: dict) -> dict | None:
-    if not isinstance(item, dict):
-        return None
-
-    event_id = (
-        item.get("id")
-        or item.get("eventId")
-        or item.get("eventid")
-        or item.get("matchId")
-        or item.get("fixtureId")
-    )
-
-    home_obj = item.get("home") or item.get("homeTeam") or item.get("teams", {}).get("home") or {}
-    away_obj = item.get("away") or item.get("awayTeam") or item.get("teams", {}).get("away") or {}
-
-    home_name = (
-        home_obj.get("name")
-        if isinstance(home_obj, dict)
-        else item.get("homeName") or item.get("home_team") or str(home_obj or "")
-    )
-    away_name = (
-        away_obj.get("name")
-        if isinstance(away_obj, dict)
-        else item.get("awayName") or item.get("away_team") or str(away_obj or "")
-    )
-
-    if not home_name or not away_name:
-        return None
-
-    league_obj = item.get("league") or item.get("tournament") or item.get("competition") or {}
-    league_name = (
-        league_obj.get("name")
-        if isinstance(league_obj, dict)
-        else item.get("leagueName") or str(league_obj or "Unknown League")
-    )
-    country_name = (
-        league_obj.get("country")
-        if isinstance(league_obj, dict)
-        else item.get("country") or item.get("countryName") or ""
-    )
-
-    kickoff = (
-        item.get("time")
-        or item.get("startTime")
-        or item.get("date")
-        or item.get("utcDate")
-        or ""
-    )
-
-    home_score = None
-    away_score = None
-
-    if isinstance(home_obj, dict) and home_obj.get("score") is not None:
-        home_score = home_obj.get("score")
-    if isinstance(away_obj, dict) and away_obj.get("score") is not None:
-        away_score = away_obj.get("score")
-
-    score_obj = item.get("score") or item.get("goals") or item.get("result")
-    if (home_score is None or away_score is None) and isinstance(score_obj, dict):
-        ft = score_obj.get("fulltime") or score_obj.get("ft") or score_obj
-        if isinstance(ft, dict):
-            home_score = ft.get("home", home_score)
-            away_score = ft.get("away", away_score)
-    elif (home_score is None or away_score is None) and isinstance(score_obj, str):
-        m = re.search(r"(\d+)\s*[-:]\s*(\d+)", score_obj)
-        if m:
-            home_score, away_score = int(m.group(1)), int(m.group(2))
-
-    outcome = None
+    if resp.status_code != 200:
+        raise ApiError(f"HTTP {resp.status_code}")
     try:
-        if home_score is not None and away_score is not None:
-            hs = int(home_score)
-            aws = int(away_score)
-            home_score, away_score = hs, aws
-            if hs > aws:
-                outcome = "1"
-            elif hs < aws:
-                outcome = "2"
-            else:
-                outcome = "X"
-    except (ValueError, TypeError):
-        pass
+        data = resp.json()
+    except Exception:
+        raise ApiError("Response was not valid JSON")
 
-    return {
-        "eventid": str(event_id) if event_id is not None else "",
-        "home": str(home_name).strip(),
-        "away": str(away_name).strip(),
-        "league": f"{country_name} - {league_name}".strip(" -"),
-        "kickoff": str(kickoff),
-        "home_score": home_score,
-        "away_score": away_score,
-        "outcome": outcome,
-    }
-
-
-def fetch_daily_fixtures(date_str: str, api_key: str) -> tuple[list[dict], str]:
-    status, data = api_get("football-get-matches-by-date", {"date": date_str}, api_key)
-    if status != 200:
-        return [], f"HTTP {status}: {data}"
-    raw_list = extract_matches_list(data)
-    parsed = [m for item in raw_list if (m := parse_match_item(item)) is not None]
-    return parsed, f"HTTP 200 ({len(parsed)} fixtures parsed)"
-
-
-def fetch_h2h_by_eventid(eventid: str, api_key: str) -> tuple[list[dict], str]:
-    if not eventid:
-        return [], "Missing eventid"
-
-    candidate_endpoints = [
-        "football-get-head-to-head",
-        "football-head-to-head",
-        "football-get-h2h",
-    ]
-    last_note = ""
-    for ep in candidate_endpoints:
-        status, data = api_get(ep, {"eventid": str(eventid)}, api_key)
-        if status == 200:
-            raw_list = extract_matches_list(data)
-            parsed = [
-                m
-                for item in raw_list
-                if (m := parse_match_item(item)) is not None and m["outcome"] in ("1", "X", "2")
-            ]
-            if parsed:
-                return parsed, f"HTTP 200 via {ep} ({len(parsed)} completed H2H matches)"
-            last_note = f"HTTP 200 via {ep} (0 completed H2H matches returned)"
+    errors = data.get("errors")
+    if errors:
+        if isinstance(errors, dict):
+            msg = "; ".join(f"{k}: {v}" for k, v in errors.items())
         else:
-            last_note = f"HTTP {status} via {ep}"
-    return [], last_note
+            msg = "; ".join(str(e) for e in errors)
+        raise ApiError(msg)
+    return data.get("response", [])
 
 
+# ---- Cached API calls (repeat scans cost nothing) ----
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def cached_fixtures_by_date(date_str: str, _api_key: str):
+    return api_get("fixtures", {"date": date_str}, _api_key)
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def cached_h2h(home_id: int, away_id: int, _api_key: str):
+    return api_get("fixtures/headtohead", {"h2h": f"{home_id}-{away_id}"}, _api_key)
+
+
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def cached_team_season(team_id: int, season: int, _api_key: str):
+    return api_get(
+        "fixtures",
+        {"team": team_id, "season": season, "status": FINISHED},
+        _api_key,
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_fixture_by_id(fixture_id: str, _api_key: str):
+    return api_get("fixtures", {"id": fixture_id}, _api_key)
+
+
+# ---- Parsing ----
+def parse_fixture(item: dict) -> dict | None:
+    try:
+        fx = item["fixture"]
+        teams = item["teams"]
+        league = item.get("league") or {}
+        status = (fx.get("status") or {}).get("short", "")
+        ft = (item.get("score") or {}).get("fulltime") or {}
+        hg, ag = ft.get("home"), ft.get("away")
+
+        outcome = None
+        if status in FINISHED_SET and hg is not None and ag is not None:
+            outcome = "1" if hg > ag else ("2" if hg < ag else "X")
+
+        return {
+            "id": fx.get("id"),
+            "ts": fx.get("timestamp") or 0,
+            "kickoff": str(fx.get("date", ""))[:16].replace("T", " "),
+            "status": status,
+            "home": teams["home"]["name"],
+            "away": teams["away"]["name"],
+            "home_id": teams["home"]["id"],
+            "away_id": teams["away"]["id"],
+            "league": f"{league.get('country', '')} - {league.get('name', '')}".strip(" -"),
+            "season": league.get("season"),
+            "hg": hg,
+            "ag": ag,
+            "outcome": outcome,
+        }
+    except (KeyError, TypeError):
+        return None
+
+
+def h2h_from(items: list) -> list[str]:
+    rows = [m for m in (parse_fixture(i) for i in items) if m and m["outcome"]]
+    rows.sort(key=lambda m: m["ts"], reverse=True)
+    return [m["outcome"] for m in rows[:5]]
+
+
+def form_from(items: list, team_id: int) -> list[dict]:
+    rows = [m for m in (parse_fixture(i) for i in items) if m and m["outcome"]]
+    rows.sort(key=lambda m: m["ts"], reverse=True)
+    rows = rows[:5]
+    for m in rows:
+        if m["home_id"] == team_id:
+            m["gf"], m["ga"] = m["hg"], m["ag"]
+        else:
+            m["gf"], m["ga"] = m["ag"], m["hg"]
+    return rows
+
+
+def estimate_lambdas(home_form: list[dict], away_form: list[dict]) -> tuple[float, float]:
+    def avg(rows, key):
+        return sum(r[key] for r in rows) / len(rows) if rows else None
+
+    hf, ha = avg(home_form, "gf"), avg(home_form, "ga")
+    af, aa = avg(away_form, "gf"), avg(away_form, "ga")
+    lam_h = (hf + aa) / 2 if hf is not None and aa is not None else 1.45
+    lam_a = (af + ha) / 2 if af is not None and ha is not None else 1.25
+    return max(0.3, min(3.5, lam_h)), max(0.3, min(3.5, lam_a))
+
+
+# ---- Model ----
 def leading_draw_streak(outcomes: list[str]) -> int:
     streak = 0
     for res in outcomes:
@@ -200,30 +152,25 @@ def leading_draw_streak(outcomes: list[str]) -> int:
 
 
 def parse_manual_sequence(raw_text: str) -> list[dict]:
-    """
-    Accepts most-recent-first tokens separated by commas, spaces, or newlines:
-    - Scores like '1-1, 0:0, 2-1, 1-2, 0-1'
-    - Codes like 'X, X, W, L, D' or 'D, D, 1, 2, 1'
-    """
+    """Most recent first. Accepts scores (1-1, 2:0) or codes (X, D, W, L, 1, 2)."""
     if not raw_text.strip():
         return []
     tokens = [t.strip() for t in re.split(r"[,;\n\s]+", raw_text.strip()) if t.strip()]
     results = []
     for tok in tokens:
-        score_match = re.match(r"^(\d+)\s*[-:]\s*(\d+)$", tok)
-        if score_match:
-            hg, ag = int(score_match.group(1)), int(score_match.group(2))
+        m = re.match(r"^(\d+)\s*[-:]\s*(\d+)$", tok)
+        if m:
+            hg, ag = int(m.group(1)), int(m.group(2))
             out = "X" if hg == ag else ("1" if hg > ag else "2")
-            results.append({"label": f"{hg}-{ag}", "outcome": out, "hg": hg, "ag": ag})
+            results.append({"outcome": out})
             continue
-
-        upper = tok.upper()
-        if upper in ("X", "D", "DRAW"):
-            results.append({"label": "X", "outcome": "X", "hg": None, "ag": None})
-        elif upper in ("1", "W", "WIN"):
-            results.append({"label": upper, "outcome": "1", "hg": None, "ag": None})
-        elif upper in ("2", "L", "LOSS"):
-            results.append({"label": upper, "outcome": "2", "hg": None, "ag": None})
+        up = tok.upper()
+        if up in ("X", "D", "DRAW"):
+            results.append({"outcome": "X"})
+        elif up in ("1", "W", "WIN"):
+            results.append({"outcome": "1"})
+        elif up in ("2", "L", "LOSS"):
+            results.append({"outcome": "2"})
     return results[:5]
 
 
@@ -236,89 +183,127 @@ def poisson_12_probability(lambda_home: float, lambda_away: float, max_goals: in
     return max(0.0, min(1.0, 1.0 - p_draw))
 
 
-def evaluate_12_model(
-    h2h_outcomes: list[str],
-    home_form: list[dict],
-    away_form: list[dict],
-    lambda_home: float = 1.45,
-    lambda_away: float = 1.25,
-) -> dict:
+def evaluate_12_model(h2h_outcomes, home_form, away_form, lambda_home=1.45, lambda_away=1.25) -> dict:
     h2h_streak = leading_draw_streak(h2h_outcomes)
     home_streak = leading_draw_streak([m["outcome"] for m in home_form])
     away_streak = leading_draw_streak([m["outcome"] for m in away_form])
 
-    rule1_triggered = h2h_streak in (2, 3)
-    rule2_triggered = (home_streak >= 2) or (away_streak >= 2)
+    rule1 = h2h_streak in (2, 3)
+    rule2 = home_streak >= 2 or away_streak >= 2
 
-    p_poisson_12 = poisson_12_probability(lambda_home, lambda_away)
+    p_poisson = poisson_12_probability(lambda_home, lambda_away)
 
-    all_outcomes = h2h_outcomes + [m["outcome"] for m in home_form] + [m["outcome"] for m in away_form]
-    if all_outcomes:
-        non_draws = sum(1 for o in all_outcomes if o in ("1", "2"))
-        p_hist_12 = non_draws / len(all_outcomes)
-    else:
-        p_hist_12 = p_poisson_12
+    all_out = list(h2h_outcomes) + [m["outcome"] for m in home_form] + [m["outcome"] for m in away_form]
+    p_hist = (sum(1 for o in all_out if o in ("1", "2")) / len(all_out)) if all_out else p_poisson
 
-    base_12 = 0.65 * p_poisson_12 + 0.35 * p_hist_12
-    streak_boost = 0.0
-    if rule1_triggered:
-        streak_boost += 0.07
-    if rule2_triggered:
-        streak_boost += 0.06
-
-    final_12_prob = min(0.96, base_12 + streak_boost)
+    base = 0.65 * p_poisson + 0.35 * p_hist
+    boost = (0.07 if rule1 else 0.0) + (0.06 if rule2 else 0.0)
+    final = min(0.96, base + boost)
 
     reasons = []
-    if rule1_triggered:
-        reasons.append(f"Rule 1 Triggered: {h2h_streak} consecutive H2H draws immediately prior")
+    if rule1:
+        reasons.append(f"Rule 1: {h2h_streak} consecutive H2H draws immediately prior")
     if home_streak >= 2:
-        reasons.append(f"Rule 2 Triggered: Home on {home_streak} consecutive draws")
+        reasons.append(f"Rule 2: Home on {home_streak} consecutive draws")
     if away_streak >= 2:
-        reasons.append(f"Rule 2 Triggered: Away on {away_streak} consecutive draws")
+        reasons.append(f"Rule 2: Away on {away_streak} consecutive draws")
 
     return {
-        "triggered": rule1_triggered or rule2_triggered,
-        "rule1": rule1_triggered,
-        "rule2": rule2_triggered,
+        "triggered": rule1 or rule2,
         "h2h_streak": h2h_streak,
         "home_streak": home_streak,
         "away_streak": away_streak,
-        "p_poisson_12": p_poisson_12,
-        "p_hist_12": p_hist_12,
-        "final_12_prob": final_12_prob,
+        "p_poisson_12": p_poisson,
+        "p_hist_12": p_hist,
+        "final_12_prob": final,
+        "lam_h": lambda_home,
+        "lam_a": lambda_away,
         "reasons": reasons,
     }
 
 
-# --- UI ---
+def analyze_fixture(fx: dict, api_key: str, use_form: bool):
+    errs = []
+    h2h = []
+    home_form, away_form = [], []
+
+    try:
+        h2h = h2h_from(cached_h2h(fx["home_id"], fx["away_id"], api_key))
+    except ApiError as exc:
+        errs.append(f"H2H: {exc}")
+
+    if use_form and fx.get("season"):
+        try:
+            home_form = form_from(cached_team_season(fx["home_id"], fx["season"], api_key), fx["home_id"])
+        except ApiError as exc:
+            errs.append(f"Home form: {exc}")
+        try:
+            away_form = form_from(cached_team_season(fx["away_id"], fx["season"], api_key), fx["away_id"])
+        except ApiError as exc:
+            errs.append(f"Away form: {exc}")
+
+    lam_h, lam_a = estimate_lambdas(home_form, away_form)
+    res = evaluate_12_model(h2h, home_form, away_form, lam_h, lam_a)
+    return res, h2h, home_form, away_form, errs
+
+
+def hit_limit(errs: list[str]) -> bool:
+    text = " ".join(errs).lower()
+    return "limit" in text or "429" in text
+
+
+# ---- UI ----
 st.title("Double Chance (12) Scanner")
-st.caption("Scans daily fixtures via `football-get-matches-by-date` + `eventid` H2H & quantitative 12 probability.")
+st.caption("Fixtures, head-to-head and team form from API-Football, with a 12 probability model.")
 
 api_key = get_api_key()
-if not api_key:
-    st.error("Missing `RAPIDAPI_KEY` in Streamlit Secrets.")
-    st.stop()
-
 with st.sidebar:
     st.header("Scanner Settings")
-    today_utc = datetime.now(timezone.utc).strftime("%Y%m%d")
-    scan_date = st.text_input("Fixture Date (YYYYMMDD)", value=today_utc)
-    max_h2h_checks = st.slider("Max Fixtures to Check H2H", min_value=5, max_value=40, value=15, step=5)
-    show_all = st.checkbox("Show Non-Triggered Matches Too", value=False)
-    show_debug = st.checkbox("Show API Endpoint Status", value=True)
+    if not api_key:
+        api_key = st.text_input("API-Football key", type="password")
+        if not api_key:
+            st.warning("Add API_FOOTBALL_KEY in Streamlit Secrets, or paste your key above.")
+    scan_date = st.date_input("Fixture date", value=datetime.now(timezone.utc).date())
+    max_checks = st.slider("Max fixtures to analyze", min_value=5, max_value=25, value=10, step=5)
+    use_form = st.checkbox("Include team form (2 extra calls per match)", value=True)
+    show_all = st.checkbox("Show non-triggered matches too", value=False)
+    calls = 1 + max_checks * (3 if use_form else 1)
+    st.caption(f"A full scan uses up to ~{calls} calls (free plan: 100 per day). Repeat scans are cached.")
 
-tab1, tab2 = st.tabs(["Live Fixture & H2H Scanner", "Instant Match Analyzer (Auto H2H + Form)"])
+    if st.button("Check API status", use_container_width=True):
+        if not api_key:
+            st.error("No key found.")
+        else:
+            try:
+                info = api_get("status", {}, api_key)
+                if isinstance(info, dict):
+                    req = info.get("requests", {})
+                    sub = info.get("subscription", {})
+                    st.success(f"Plan: {sub.get('plan', '?')}")
+                    st.write(f"Requests today: {req.get('current', '?')} / {req.get('limit_day', '?')}")
+            except ApiError as exc:
+                st.error(f"Status check failed: {exc}")
+
+if not api_key:
+    st.stop()
+
+tab1, tab2 = st.tabs(["Live Fixture & H2H Scanner", "Instant Match Analyzer"])
 
 with tab1:
     league_filter = st.text_input(
-        "Optional Country / League Filter (leave blank for ALL global leagues)",
-        placeholder="e.g. England, Brazil, Germany, Serie B, Liga...",
+        "Optional Country / League Filter (leave blank for ALL)",
+        placeholder="e.g. England, Brazil, Germany, Serie B...",
     )
 
     if st.button("Scan Global Fixtures", type="primary", use_container_width=True):
-        with st.spinner("Fetching fixtures..."):
-            fixtures, fix_status = fetch_daily_fixtures(scan_date.strip(), api_key)
+        date_str = scan_date.strftime("%Y-%m-%d")
+        try:
+            raw = cached_fixtures_by_date(date_str, api_key)
+        except ApiError as exc:
+            st.error(f"Could not load fixtures: {exc}")
+            st.stop()
 
+        fixtures = [m for m in (parse_fixture(i) for i in raw) if m and m["status"] in NOT_STARTED]
         if league_filter.strip():
             q = league_filter.strip().lower()
             fixtures = [
@@ -327,119 +312,97 @@ with tab1:
             ]
 
         if not fixtures:
-            st.warning(f"No fixtures matched. ({fix_status})")
+            st.warning("No upcoming fixtures found for that date and filter.")
         else:
-            batch = fixtures[:max_h2h_checks]
-            st.info(f"Found {len(fixtures)} fixtures ({fix_status}). Checking H2H by `eventid` for {len(batch)} matches...")
-
+            batch = fixtures[:max_checks]
+            st.info(f"Found {len(fixtures)} upcoming fixtures. Analyzing {len(batch)}...")
             progress = st.progress(0)
-            results_rows = []
-            debug_logs = []
+            rows = []
+            problems = []
 
             for idx, fx in enumerate(batch):
-                h2h_matches, h2h_status = fetch_h2h_by_eventid(fx["eventid"], api_key)
-                h2h_outcomes = [m["outcome"] for m in h2h_matches]
-                eval_res = evaluate_12_model(h2h_outcomes, [], [])
-
-                if show_debug:
-                    debug_logs.append(
-                        f"**{fx['home']} vs {fx['away']}** (`eventid={fx['eventid']}`): "
-                        f"{h2h_status} | H2H seq: `{h2h_outcomes[:5]}`"
-                    )
-
-                if eval_res["triggered"] or show_all:
-                    results_rows.append((fx, h2h_outcomes, eval_res))
-
+                res, h2h, hform, aform, errs = analyze_fixture(fx, api_key, use_form)
+                if errs:
+                    problems.append(f"{fx['home']} vs {fx['away']}: " + " | ".join(errs))
+                if hit_limit(errs):
+                    st.error("Daily request limit reached. Showing results found so far.")
+                    break
+                if res["triggered"] or show_all:
+                    rows.append((fx, h2h, res))
                 progress.progress((idx + 1) / len(batch))
 
-            if not results_rows:
-                st.warning(
-                    "No fixtures in this batch triggered the 2-3 consecutive H2H draw rule. "
-                    "Turn on 'Show Non-Triggered Matches Too' in the sidebar or analyze any match below in Tab 2."
-                )
+            if not rows:
+                st.warning("No fixtures triggered the rules. Tick 'Show non-triggered matches too' to see all.")
             else:
-                results_rows.sort(key=lambda r: (r[2]["triggered"], r[2]["final_12_prob"]), reverse=True)
-                for fx, h2h_outcomes, eval_res in results_rows:
-                    badge = "TRIGGERED 12 SIGNAL" if eval_res["triggered"] else "WATCHLIST"
+                rows.sort(key=lambda r: (r[2]["triggered"], r[2]["final_12_prob"]), reverse=True)
+                for fx, h2h, res in rows:
+                    badge = "TRIGGERED" if res["triggered"] else "WATCHLIST"
                     with st.container(border=True):
                         st.subheader(f"[{badge}] {fx['home']} vs {fx['away']}")
-                        st.caption(f"{fx['league']} | Kickoff: {fx['kickoff']} | eventid: {fx['eventid']}")
+                        st.caption(f"{fx['league']} | {fx['kickoff']} UTC | fixture id: {fx['id']}")
                         c1, c2, c3 = st.columns(3)
-                        c1.metric("12 Win Probability", f"{eval_res['final_12_prob']*100:.1f}%")
-                        c2.metric("H2H Draw Streak", f"{eval_res['h2h_streak']}")
-                        c3.metric("Recent H2H (Latest First)", " - ".join(h2h_outcomes[:5]) or "None")
-                        for r in eval_res["reasons"]:
+                        c1.metric("12 Probability", f"{res['final_12_prob'] * 100:.1f}%")
+                        c2.metric("H2H Draw Streak", res["h2h_streak"])
+                        c3.metric("Recent H2H", " - ".join(h2h) or "None")
+                        for r in res["reasons"]:
                             st.success(r)
 
-            if show_debug and debug_logs:
-                with st.expander("API Endpoint Debug Log", expanded=False):
-                    for line in debug_logs:
-                        st.markdown(f"- {line}")
+            if problems:
+                with st.expander("API problems (tap to view)"):
+                    for p in problems:
+                        st.write("- " + p)
 
 with tab2:
-    st.markdown("Enter an **Event ID** from any fixture to auto-fetch H2H, and paste each team's **Last 5 results** (most recent first).")
-
-    col_id, col_btn = st.columns([2, 1])
-    with col_id:
-        manual_eventid = st.text_input("Fixture Event ID (`eventid`)", value="4621624")
-    with col_btn:
-        st.write("")
-        st.write("")
-        fetch_btn = st.button("Auto-Fetch H2H", use_container_width=True)
-
-    if "fetched_h2h" not in st.session_state:
-        st.session_state["fetched_h2h"] = []
-        st.session_state["fetched_h2h_note"] = ""
-
-    if fetch_btn:
-        h2h_list, h2h_note = fetch_h2h_by_eventid(manual_eventid.strip(), api_key)
-        st.session_state["fetched_h2h"] = [m["outcome"] for m in h2h_list]
-        st.session_state["fetched_h2h_note"] = h2h_note
-
-    if st.session_state["fetched_h2h_note"]:
-        st.caption(f"H2H Status: {st.session_state['fetched_h2h_note']}")
-
-    c_h, c_a = st.columns(2)
-    with c_h:
-        home_team = st.text_input("Home Team", value="Home Team")
-        home_last5_raw = st.text_input(
-            "Home Last 5 (most recent first — e.g. 1-1, 0-0, 2-1, 1-0, 0-2 or X, X, W, W, L)",
-            value="1-1, 0-0, 2-1, 1-0, 1-2",
-        )
-        lam_h = st.number_input("Home Expected Goals (λ)", min_value=0.2, max_value=4.5, value=1.45, step=0.05)
-
-    with c_a:
-        away_team = st.text_input("Away Team", value="Away Team")
-        away_last5_raw = st.text_input(
-            "Away Last 5 (most recent first — e.g. 2-1, 1-1, 0-1, 3-1, 1-0 or W, X, L, W, W)",
-            value="2-1, 1-1, 0-1, 2-0, 1-1",
-        )
-        lam_a = st.number_input("Away Expected Goals (λ)", min_value=0.2, max_value=4.5, value=1.25, step=0.05)
-
-    h2h_override = st.text_input(
-        "H2H Sequence (most recent first — auto-filled if fetched, or type e.g. X, X, 1, 2, X)",
-        value=", ".join(st.session_state["fetched_h2h"][:5]),
-    )
-
-    if st.button("Calculate Double Chance (12) Signal", type="primary", use_container_width=True):
-        home_seq = parse_manual_sequence(home_last5_raw)
-        away_seq = parse_manual_sequence(away_last5_raw)
-        h2h_seq = [m["outcome"] for m in parse_manual_sequence(h2h_override)]
-
-        res = evaluate_12_model(h2h_seq, home_seq, away_seq, lam_h, lam_a)
-
-        st.divider()
-        st.subheader(f"{home_team} vs {away_team} — Double Chance (12) Analysis")
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Final 12 Probability", f"{res['final_12_prob']*100:.1f}%")
-        m2.metric("Poisson 12 Prob", f"{res['p_poisson_12']*100:.1f}%")
-        m3.metric("H2H Draw Streak", res["h2h_streak"])
-        m4.metric("Home / Away Streaks", f"{res['home_streak']} / {res['away_streak']}")
-
-        if res["triggered"]:
-            st.success("RECOMMENDATION: BACK DOUBLE CHANCE (12) — Draw-Breakout Signal Active")
-            for reason in res["reasons"]:
-                st.write(f"- {reason}")
+    st.markdown("Enter a **fixture id** (shown on the scanner cards) to auto-fetch H2H and team form.")
+    fid = st.text_input("Fixture id")
+    if st.button("Analyze fixture", type="primary", use_container_width=True):
+        if not fid.strip():
+            st.warning("Enter a fixture id first.")
         else:
-            st.info("No 2+ consecutive draw streak detected in H2H or Team Form; rely on Poisson 12 probability above.")
+            try:
+                raw = cached_fixture_by_id(fid.strip(), api_key)
+                fx = parse_fixture(raw[0]) if raw else None
+            except ApiError as exc:
+                fx = None
+                st.error(f"Could not load fixture: {exc}")
+            if fx:
+                res, h2h, hform, aform, errs = analyze_fixture(fx, api_key, True)
+                st.subheader(f"{fx['home']} vs {fx['away']}")
+                st.caption(f"{fx['league']} | {fx['kickoff']} UTC")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("12 Probability", f"{res['final_12_prob'] * 100:.1f}%")
+                m2.metric("Poisson 12", f"{res['p_poisson_12'] * 100:.1f}%")
+                m3.metric("H2H Draw Streak", res["h2h_streak"])
+                m4.metric("Home / Away Streaks", f"{res['home_streak']} / {res['away_streak']}")
+                st.write(f"H2H (latest first): {' - '.join(h2h) or 'None'}")
+                st.write(f"Home form: {' - '.join(m['outcome'] for m in hform) or 'None'}")
+                st.write(f"Away form: {' - '.join(m['outcome'] for m in aform) or 'None'}")
+                st.write(f"Expected goals used: {res['lam_h']:.2f} (home), {res['lam_a']:.2f} (away)")
+                if res["triggered"]:
+                    st.success("Draw-breakout signal active")
+                    for r in res["reasons"]:
+                        st.write(f"- {r}")
+                else:
+                    st.info("No 2+ draw streak found; rely on the probability above.")
+                for e in errs:
+                    st.warning(e)
+            elif fid.strip():
+                st.warning("No fixture found for that id.")
+
+    with st.expander("Or enter results manually"):
+        h2h_raw = st.text_input("H2H (latest first, e.g. X, X, 1, 2, X)")
+        home_raw = st.text_input("Home last 5 (e.g. 1-1, 0-0, 2-1, 1-0, 1-2)")
+        away_raw = st.text_input("Away last 5 (e.g. 2-1, 1-1, 0-1, 2-0, 1-1)")
+        lam_h = st.number_input("Home expected goals", 0.2, 4.5, 1.45, 0.05)
+        lam_a = st.number_input("Away expected goals", 0.2, 4.5, 1.25, 0.05)
+        if st.button("Calculate manually", use_container_width=True):
+            res = evaluate_12_model(
+                [m["outcome"] for m in parse_manual_sequence(h2h_raw)],
+                parse_manual_sequence(home_raw),
+                parse_manual_sequence(away_raw),
+                lam_h,
+                lam_a,
+            )
+            st.metric("12 Probability", f"{res['final_12_prob'] * 100:.1f}%")
+            for r in res["reasons"]:
+                st.write(f"- {r}")
