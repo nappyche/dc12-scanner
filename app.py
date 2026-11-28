@@ -1,5 +1,6 @@
 import math
 import re
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -26,6 +27,7 @@ def get_api_key() -> str:
 
 def api_get(endpoint: str, params: dict, api_key: str):
     """Calls API-Football. Raises ApiError on any problem (so failures are never cached)."""
+    time.sleep(6.5)  # free plan allows about 10 calls per minute; cached calls skip this
     try:
         resp = requests.get(
             f"{BASE_URL}/{endpoint}",
@@ -264,11 +266,14 @@ with st.sidebar:
         if not api_key:
             st.warning("Add API_FOOTBALL_KEY in Streamlit Secrets, or paste your key above.")
     scan_date = st.date_input("Fixture date", value=datetime.now(timezone.utc).date())
-    max_checks = st.slider("Max fixtures to analyze", min_value=5, max_value=25, value=10, step=5)
+    max_checks = st.slider("Max fixtures to analyze", min_value=5, max_value=25, value=5, step=5)
     use_form = st.checkbox("Include team form (2 extra calls per match)", value=True)
     show_all = st.checkbox("Show non-triggered matches too", value=False)
     calls = 1 + max_checks * (3 if use_form else 1)
-    st.caption(f"A full scan uses up to ~{calls} calls (free plan: 100 per day). Repeat scans are cached.")
+    st.caption(
+        f"A full scan uses up to ~{calls} calls (free plan: 100 per day, 10 per minute) "
+        f"and takes about {calls * 6.5 / 60:.1f} min. Repeat scans are cached."
+    )
 
     if st.button("Check API status", use_container_width=True):
         if not api_key:
@@ -325,7 +330,10 @@ with tab1:
                 if errs:
                     problems.append(f"{fx['home']} vs {fx['away']}: " + " | ".join(errs))
                 if hit_limit(errs):
-                    st.error("Daily request limit reached. Showing results found so far.")
+                    st.error(
+                        "The API said you hit a request limit (per-minute or daily). "
+                        "Wait one minute and scan again: matches already analyzed are cached and cost nothing."
+                    )
                     break
                 if res["triggered"] or show_all:
                     rows.append((fx, h2h, res))
